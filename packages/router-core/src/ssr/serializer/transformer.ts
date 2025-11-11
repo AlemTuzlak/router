@@ -9,6 +9,10 @@ import type {
 import type { LooseReturnType } from '../../utils'
 import type { AnyRoute, ResolveAllSSR } from '../../route'
 
+declare const TSR_SERIALIZABLE: unique symbol
+export type TSR_SERIALIZABLE = typeof TSR_SERIALIZABLE
+
+export type TsrSerializable = { [TSR_SERIALIZABLE]: true }
 export interface DefaultSerializable {
   number: number
   string: string
@@ -17,6 +21,7 @@ export interface DefaultSerializable {
   undefined: undefined
   bigint: bigint
   Date: Date
+  TsrSerializable: TsrSerializable
 }
 
 export interface SerializableExtensions extends DefaultSerializable {}
@@ -27,6 +32,10 @@ export type UnionizeSerializationAdaptersInput<
   TAdapters extends ReadonlyArray<AnySerializationAdapter>,
 > = TAdapters[number]['~types']['input']
 
+/**
+ * Create a strongly-typed serialization adapter for SSR hydration.
+ * Use to register custom types with the router serializer.
+ */
 export function createSerializationAdapter<
   TInput = unknown,
   TOutput = unknown,
@@ -75,7 +84,20 @@ export type ValidateSerializable<T, TSerializable> =
               ? ValidateSerializableSet<T, TSerializable>
               : T extends Map<any, any>
                 ? ValidateSerializableMap<T, TSerializable>
-                : { [K in keyof T]: ValidateSerializable<T[K], TSerializable> }
+                : T extends AsyncGenerator<any, any>
+                  ? ValidateSerializableAsyncGenerator<T, TSerializable>
+                  : {
+                      [K in keyof T]: ValidateSerializable<T[K], TSerializable>
+                    }
+
+export type ValidateSerializableAsyncGenerator<T, TSerializable> =
+  T extends AsyncGenerator<infer T, infer TReturn, infer TNext>
+    ? AsyncGenerator<
+        ValidateSerializable<T, TSerializable>,
+        ValidateSerializable<TReturn, TSerializable>,
+        TNext
+      >
+    : never
 
 export type ValidateSerializablePromise<T, TSerializable> =
   T extends Promise<infer TAwaited>
@@ -136,17 +158,13 @@ export interface SerializationAdapterTypes<
 
 export type AnySerializationAdapter = SerializationAdapter<any, any, any>
 
+/** Create a Seroval plugin for server-side serialization only. */
 export function makeSsrSerovalPlugin(
   serializationAdapter: AnySerializationAdapter,
   options: { didRun: boolean },
 ): Plugin<any, SerovalNode> {
   return createPlugin<any, SerovalNode>({
     tag: '$TSR/t/' + serializationAdapter.key,
-    extends: serializationAdapter.extends
-      ? (serializationAdapter.extends as Array<AnySerializationAdapter>).map(
-          (ext) => makeSsrSerovalPlugin(ext, options),
-        )
-      : undefined,
     test: serializationAdapter.test,
     parse: {
       stream(value, ctx) {
@@ -169,16 +187,12 @@ export function makeSsrSerovalPlugin(
   })
 }
 
+/** Create a Seroval plugin for client/server symmetric (de)serialization. */
 export function makeSerovalPlugin(
   serializationAdapter: AnySerializationAdapter,
 ): Plugin<any, SerovalNode> {
   return createPlugin<any, SerovalNode>({
     tag: '$TSR/t/' + serializationAdapter.key,
-    extends: serializationAdapter.extends
-      ? (serializationAdapter.extends as Array<AnySerializationAdapter>).map(
-          makeSerovalPlugin,
-        )
-      : undefined,
     test: serializationAdapter.test,
     parse: {
       sync(value, ctx) {

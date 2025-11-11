@@ -129,7 +129,7 @@ import {
   HeadContent,
   Scripts,
 } from "@tanstack/react-router"
-import "./globals.css"
+import appCss from "./globals.css?url"
 
 - export const metadata: Metadata = { // [!code --]
 -   title: "Create Next App", // [!code --]
@@ -144,6 +144,12 @@ export const Route = createRootRoute({
         content: "width=device-width, initial-scale=1",
       },
       { title: "TanStack Start Starter" }
+    ],
+    links: [
+      {
+        rel: 'stylesheet',
+        href: appCss,
+      },
     ],
   }),
   component: RootLayout,
@@ -182,6 +188,8 @@ Instead of `page.tsx`, create an `index.tsx` file for the `/` route.
 - `src/app/page.tsx` to `src/app/index.tsx`
 
 ```tsx
++ import { createFileRoute } from '@tanstack/react-router' // [!code ++]
+
 - export default function Home() { // [!code --]
 + export const Route = createFileRoute('/')({ // [!code ++]
 +   component: Home, // [!code ++]
@@ -192,7 +200,7 @@ Instead of `page.tsx`, create an `index.tsx` file for the `/` route.
     <main className="min-h-dvh w-screen flex items-center justify-center flex-col gap-y-4 p-4">
       <img
         className="max-w-sm w-full"
-        src="https://raw.githubusercontent.com/tanstack/tanstack.com/main/src/images/splash-dark.png"
+        src="https://raw.githubusercontent.com/TanStack/tanstack.com/main/public/images/logos/splash-dark.png"
         alt="TanStack Logo"
       />
       <h1>
@@ -310,8 +318,13 @@ Next.js uses the `next/image` component for optimized images. In TanStack Start,
 and almost a drop-in replacement.
 
 ```tsx
+<<<<<<< HEAD
 import Image from "next/image" // [!code --]
 import { Image } from "@unpic/react"; // [!code ++]
+=======
+import Image from 'next/image' // [!code --]
+import { Image } from '@unpic/react' // [!code ++]
+>>>>>>> main
 function Component() {
   return (
     <Image
@@ -326,7 +339,10 @@ function Component() {
 }
 ```
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> main
 ### Server ~Actions~ Functions
 
 ```tsx
@@ -340,7 +356,7 @@ function Component() {
 + }) // [!code ++]
 ```
 
-Learn more about the [Server Functions](../server-functions.md).
+Learn more about the [Server Functions](../guide/server-functions).
 
 ### Server Routes ~Handlers~
 
@@ -357,7 +373,7 @@ Learn more about the [Server Functions](../server-functions.md).
 + }) // [!code ++]
 ```
 
-Learn more about the [Server Routes](../server-routes.md).
+Learn more about the [Server Routes](../guide/server-routes).
 
 ### Fonts
 

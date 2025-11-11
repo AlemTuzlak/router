@@ -204,7 +204,9 @@ export {
   PathParamError,
   getInitialRouterState,
   getMatchedRoutes,
+  trailingSlashOptions,
 } from './router'
+
 export type {
   ViewTransitionOptions,
   TrailingSlashOption,
@@ -276,6 +278,7 @@ export {
   deepEqual,
   createControlledPromise,
   isModuleNotFoundError,
+  decodePath,
 } from './utils'
 export type {
   NoInfer,
@@ -423,6 +426,8 @@ export type {
   SerializableExtensions,
   DefaultSerializable,
   Serializable,
+  TSR_SERIALIZABLE,
+  TsrSerializable,
 } from './ssr/serializer/transformer'
 
 export {
@@ -434,7 +439,6 @@ export {
 export { defaultSerovalPlugins } from './ssr/serializer/seroval-plugins'
 
 export {
-  rewriteBasepath,
   composeRewrites,
   executeRewriteInput,
   executeRewriteOutput,

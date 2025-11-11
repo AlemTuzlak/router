@@ -8,8 +8,6 @@ import {
   executeRewriteInput,
   isRedirect,
   isResolvedRedirect,
-  joinPaths,
-  trimPath,
 } from '@tanstack/router-core'
 import {
   attachRouterServerSsrUtils,
@@ -56,19 +54,7 @@ function getStartResponseHeaders(opts: { router: AnyRouter }) {
 export function createStartHandler<TRegister = Register>(
   cb: HandlerCallback<AnyRouter>,
 ): RequestHandler<TRegister> {
-  if (!process.env.TSS_SERVER_FN_BASE) {
-    throw new Error(
-      'tanstack/start-server-core: TSS_SERVER_FN_BASE must be defined in your environment for createStartHandler()',
-    )
-  }
-  // TODO do we remove this?
-  const APP_BASE = process.env.TSS_APP_BASE || '/'
-  // Add trailing slash to sanitise user defined TSS_SERVER_FN_BASE
-  const serverFnBase = joinPaths([
-    APP_BASE,
-    trimPath(process.env.TSS_SERVER_FN_BASE),
-    '/',
-  ])
+  const ROUTER_BASEPATH = process.env.TSS_ROUTER_BASEPATH || '/'
   let startRoutesManifest: Manifest | null = null
   let startEntry: StartEntry | null = null
   let routerEntry: RouterEntry | null = null
@@ -134,7 +120,6 @@ export function createStartHandler<TRegister = Register>(
     let router: AnyRouter | null = null
     const getRouter = async () => {
       if (router) return router
-      // TODO how does this work with base path? does the router need to be configured the same as APP_BASE?
       router = await (await getEntries()).routerEntry.getRouter()
 
       // Update the client-side router with the history
@@ -160,8 +145,12 @@ export function createStartHandler<TRegister = Register>(
         origin: router.options.origin ?? origin,
         ...{
           defaultSsr: startOptions.defaultSsr,
-          serializationAdapters: startOptions.serializationAdapters,
+          serializationAdapters: [
+            ...(startOptions.serializationAdapters || []),
+            ...(router.options.serializationAdapters || []),
+          ],
         },
+        basepath: ROUTER_BASEPATH,
       })
       return router
     }
@@ -181,11 +170,12 @@ export function createStartHandler<TRegister = Register>(
             getRouter,
             startOptions,
             contextAfterGlobalMiddlewares: context,
+            request,
           },
           async () => {
             try {
               // First, let's attempt to handle server functions
-              if (href.startsWith(serverFnBase)) {
+              if (href.startsWith(process.env.TSS_SERVER_FN_BASE)) {
                 return await handleServerAction({
                   request,
                   context: requestOpts?.context,
@@ -222,9 +212,7 @@ export function createStartHandler<TRegister = Register>(
 
                 // if the startRoutesManifest is not loaded yet, load it once
                 if (startRoutesManifest === null) {
-                  startRoutesManifest = await getStartManifest({
-                    basePath: APP_BASE,
-                  })
+                  startRoutesManifest = await getStartManifest()
                 }
                 const router = await getRouter()
                 attachRouterServerSsrUtils({
@@ -256,6 +244,7 @@ export function createStartHandler<TRegister = Register>(
                 getRouter,
                 request,
                 executeRouter,
+                context,
               })
 
               return response
@@ -355,6 +344,7 @@ async function handleServerRoutes({
   getRouter,
   request,
   executeRouter,
+  context,
 }: {
   getRouter: () => Awaitable<AnyRouter>
   request: Request
@@ -363,6 +353,7 @@ async function handleServerRoutes({
   }: {
     serverContext: any
   }) => Promise<Response>
+  context: any
 }) {
   const router = await getRouter()
   let url = new URL(request.url)
@@ -390,39 +381,25 @@ async function handleServerRoutes({
             })
           : server.handlers
 
-      const requestMethod = request.method.toLowerCase()
+      const requestMethod = request.method.toUpperCase() as RouteMethod
 
       // Attempt to find the method in the handlers
-      let method = Object.keys(handlers).find(
-        (method) => method.toLowerCase() === requestMethod,
-      )
-
-      // If no method is found, attempt to find the 'all' method
-      if (!method) {
-        method = Object.keys(handlers).find(
-          (method) => method.toLowerCase() === 'all',
-        )
-          ? 'all'
-          : undefined
-      }
+      const handler = handlers[requestMethod] ?? handlers['ANY']
 
       // If a method is found, execute the handler
-      if (method) {
-        const handler = handlers[method as RouteMethod]
-        if (handler) {
-          const mayDefer = !!foundRoute.options.component
-          if (typeof handler === 'function') {
-            middlewares.push(handlerToMiddleware(handler, mayDefer))
-          } else {
-            const { middleware } = handler
-            if (middleware && middleware.length) {
-              middlewares.push(
-                ...flattenMiddlewares(middleware).map((d) => d.options.server),
-              )
-            }
-            if (handler.handler) {
-              middlewares.push(handlerToMiddleware(handler.handler, mayDefer))
-            }
+      if (handler) {
+        const mayDefer = !!foundRoute.options.component
+        if (typeof handler === 'function') {
+          middlewares.push(handlerToMiddleware(handler, mayDefer))
+        } else {
+          const { middleware } = handler
+          if (middleware && middleware.length) {
+            middlewares.push(
+              ...flattenMiddlewares(middleware).map((d) => d.options.server),
+            )
+          }
+          if (handler.handler) {
+            middlewares.push(handlerToMiddleware(handler.handler, mayDefer))
           }
         }
       }
@@ -436,7 +413,7 @@ async function handleServerRoutes({
 
   const ctx = await executeMiddleware(middlewares, {
     request,
-    context: {},
+    context,
     params: routeParams,
     pathname,
   })
@@ -464,7 +441,7 @@ function throwIfMayNotDefer() {
   throw new Error('Internal Server Error')
 }
 function handlerToMiddleware(
-  handler: RouteMethodHandlerFn<any, AnyRoute, any, any, any, any>,
+  handler: RouteMethodHandlerFn<any, AnyRoute, any, any, any, any, any>,
   mayDefer: boolean = false,
 ) {
   if (mayDefer) {

@@ -211,7 +211,7 @@ export { useAwaited, Await } from './awaited'
 export type { AwaitOptions } from './awaited'
 
 export { CatchBoundary, ErrorComponent } from './CatchBoundary'
-export { ClientOnly } from './ClientOnly'
+export { ClientOnly, useHydrated } from './ClientOnly'
 
 export {
   FileRoute,
@@ -352,7 +352,7 @@ export { ScriptOnce } from './ScriptOnce'
 export { Asset } from './Asset'
 export { HeadContent, useTags } from './HeadContent'
 export { Scripts } from './Scripts'
-export { rewriteBasepath, composeRewrites } from '@tanstack/router-core'
+export { composeRewrites } from '@tanstack/router-core'
 export type {
   LocationRewrite,
   LocationRewriteFunction,

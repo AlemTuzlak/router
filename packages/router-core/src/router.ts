@@ -2,6 +2,7 @@ import { Store, batch } from '@tanstack/store'
 import { createBrowserHistory, parseHref } from '@tanstack/history'
 import {
   createControlledPromise,
+  decodePath,
   deepEqual,
   findLast,
   functionalUpdate,
@@ -285,18 +286,6 @@ export interface RouterOptions<
   routeTree?: TRouteTree
   /**
    * The basepath for then entire router. This is useful for mounting a router instance at a subpath.
-   *
-   * @deprecated - use `rewrite.input` with the new `rewriteBasepath` utility instead:
-   * ```ts
-   * const router = createRouter({
-   *   routeTree,
-   *   rewrite: rewriteBasepath('/basepath')
-   *   // Or wrap existing rewrite functionality
-   *   rewrite: rewriteBasepath('/basepath', {
-   *     output: ({ url }) => {...},
-   *     input: ({ url }) => {...},
-   *   })
-   * })
    * ```
    * @default '/'
    * @link [API Docs](https://tanstack.com/router/latest/docs/framework/react/api/router/RouterOptionsType#basepath-property)
@@ -472,8 +461,8 @@ export interface RouterOptions<
    * Configures how the router will rewrite the location between the actual href and the internal href of the router.
    *
    * @default undefined
-   * @description You can provide a custom rewrite pair (in/out) or use the utilities like `rewriteBasepath` as a convenience for common use cases, or even do both!
-   * This is useful for basepath rewriting, shifting data from the origin to the path (for things like )
+   * @description You can provide a custom rewrite pair (in/out).
+   * This is useful for shifting data from the origin to the path (for things like subdomain routing), or other advanced use cases.
    */
   rewrite?: LocationRewrite
   origin?: string
@@ -485,14 +474,12 @@ export interface RouterOptions<
 export type LocationRewrite = {
   /**
    * A function that will be called to rewrite the URL before it is interpreted by the router from the history instance.
-   * Utilities like `rewriteBasepath` are provided as a convenience for common use cases.
    *
    * @default undefined
    */
   input?: LocationRewriteFunction
   /**
    * A function that will be called to rewrite the URL before it is committed to the actual history instance from the router.
-   * Utilities like `rewriteBasepath` are provided as a convenience for common use cases.
    *
    * @default undefined
    */
@@ -788,10 +775,14 @@ export interface ViewTransitionOptions {
         pathChanged: boolean
         hrefChanged: boolean
         hashChanged: boolean
-      }) => Array<string>)
+      }) => Array<string> | false)
 }
 
 // TODO where is this used? can we remove this?
+/**
+ * Convert an unknown error into a minimal, serializable object.
+ * Includes name and message (and stack in development).
+ */
 export function defaultSerializeError(err: unknown) {
   if (err instanceof Error) {
     const obj = {
@@ -811,8 +802,20 @@ export function defaultSerializeError(err: unknown) {
   }
 }
 
-export type TrailingSlashOption = 'always' | 'never' | 'preserve'
+/** Options for configuring trailing-slash behavior. */
+export const trailingSlashOptions = {
+  always: 'always',
+  never: 'never',
+  preserve: 'preserve',
+} as const
 
+export type TrailingSlashOption =
+  (typeof trailingSlashOptions)[keyof typeof trailingSlashOptions]
+
+/**
+ * Compute whether path, href or hash changed between previous and current
+ * resolved locations in router state.
+ */
 export function getLocationChangeInfo(routerState: {
   resolvedLocation?: ParsedLocation
   location: ParsedLocation
@@ -849,6 +852,15 @@ export type CreateRouterFn = <
   TDehydrated
 >
 
+/**
+ * Core, framework-agnostic router engine that powers TanStack Router.
+ *
+ * Provides navigation, matching, loading, preloading, caching and event APIs
+ * used by framework adapters (React/Solid). Prefer framework helpers like
+ * `createRouter` in app code.
+ *
+ * @link https://tanstack.com/router/latest/docs/framework/react/api/router/RouterType
+ */
 export class RouterCore<
   in out TRouteTree extends AnyRoute,
   in out TTrailingSlashOption extends TrailingSlashOption,
@@ -884,7 +896,7 @@ export class RouterCore<
   rewrite?: LocationRewrite
   origin?: string
   latestLocation!: ParsedLocation<FullSearchSchema<TRouteTree>>
-  // @deprecated - basepath functionality is now implemented via the `rewrite` option
+  pendingBuiltLocation?: ParsedLocation<FullSearchSchema<TRouteTree>>
   basepath!: string
   routeTree!: TRouteTree
   routesById!: RoutesById<TRouteTree>
@@ -948,8 +960,13 @@ export class RouterCore<
       )
     }
 
+    const prevOptions = this.options
+    const prevBasepath = this.basepath ?? prevOptions?.basepath ?? '/'
+    const basepathWasUnset = this.basepath === undefined
+    const prevRewriteOption = prevOptions?.rewrite
+
     this.options = {
-      ...this.options,
+      ...prevOptions,
       ...newOptions,
     }
 
@@ -976,29 +993,17 @@ export class RouterCore<
         this.history = this.options.history
       }
     }
-    // For backwards compatibility, we support a basepath option, which we now implement as a rewrite
-    if (this.options.basepath) {
-      const basepathRewrite = rewriteBasepath({
-        basepath: this.options.basepath,
-      })
-      if (this.options.rewrite) {
-        this.rewrite = composeRewrites([basepathRewrite, this.options.rewrite])
-      } else {
-        this.rewrite = basepathRewrite
-      }
-    } else {
-      this.rewrite = this.options.rewrite
-    }
 
     this.origin = this.options.origin
     if (!this.origin) {
-      if (!this.isServer) {
+      if (!this.isServer && window?.origin && window.origin !== 'null') {
         this.origin = window.origin
       } else {
         // fallback for the server, can be overridden by calling router.update({origin}) on the server
         this.origin = 'http://localhost'
       }
     }
+
     if (this.history) {
       this.updateLatestLocation()
     }
@@ -1021,6 +1026,48 @@ export class RouterCore<
       })
 
       setupScrollRestoration(this)
+    }
+
+    let needsLocationUpdate = false
+    const nextBasepath = this.options.basepath ?? '/'
+    const nextRewriteOption = this.options.rewrite
+    const basepathChanged = basepathWasUnset || prevBasepath !== nextBasepath
+    const rewriteChanged = prevRewriteOption !== nextRewriteOption
+
+    if (basepathChanged || rewriteChanged) {
+      this.basepath = nextBasepath
+
+      const rewrites: Array<LocationRewrite> = []
+      if (trimPath(nextBasepath) !== '') {
+        rewrites.push(
+          rewriteBasepath({
+            basepath: nextBasepath,
+          }),
+        )
+      }
+      if (nextRewriteOption) {
+        rewrites.push(nextRewriteOption)
+      }
+
+      this.rewrite =
+        rewrites.length === 0
+          ? undefined
+          : rewrites.length === 1
+            ? rewrites[0]
+            : composeRewrites(rewrites)
+
+      if (this.history) {
+        this.updateLatestLocation()
+      }
+
+      needsLocationUpdate = true
+    }
+
+    if (needsLocationUpdate && this.__store) {
+      this.__store.state = {
+        ...this.state,
+        location: this.latestLocation,
+      }
     }
 
     if (
@@ -1069,6 +1116,12 @@ export class RouterCore<
     }
   }
 
+  /**
+   * Subscribe to router lifecycle events like `onBeforeNavigate`, `onLoad`,
+   * `onResolved`, etc. Returns an unsubscribe function.
+   *
+   * @link https://tanstack.com/router/latest/docs/framework/react/api/router/RouterEventsType
+   */
   subscribe: SubscribeFn = (eventType, fn) => {
     const listener: RouterListener<any> = {
       eventType,
@@ -1090,6 +1143,10 @@ export class RouterCore<
     })
   }
 
+  /**
+   * Parse a HistoryLocation into a strongly-typed ParsedLocation using the
+   * current router options, rewrite rules and search parser/stringifier.
+   */
   parseLocation: ParseLocationFn<TRouteTree> = (
     locationToParse,
     previousLocation,
@@ -1117,7 +1174,7 @@ export class RouterCore<
         href: fullPath,
         publicHref: href,
         url: url.href,
-        pathname,
+        pathname: decodePath(pathname),
         searchStr,
         search: replaceEqualDeep(previousLocation?.search, parsedSearch) as any,
         hash: hash.split('#').reverse()[0] ?? '',
@@ -1142,10 +1199,10 @@ export class RouterCore<
         maskedLocation: location,
       }
     }
-
     return location
   }
 
+  /** Resolve a path against the router basepath and trailing-slash policy. */
   resolvePathWithBase = (from: string, path: string) => {
     const resolvedPath = resolvePath({
       base: from,
@@ -1307,13 +1364,12 @@ export class RouterCore<
       // Existing matches are matches that are already loaded along with
       // pending matches that are still loading
       const matchId =
-        interpolatePath({
-          path: route.id,
-          params: routeParams,
-          leaveWildcards: true,
-          decodeCharMap: this.pathParamsDecodeCharMap,
-          parseCache: this.parsePathnameCache,
-        }).interpolatedPath + loaderDepsHash
+        // route.id for disambiguation
+        route.id +
+        // interpolatedPath for param changes
+        interpolatedPath +
+        // explicit deps
+        loaderDepsHash
 
       const existingMatch = this.getMatch(matchId)
 
@@ -1507,11 +1563,29 @@ export class RouterCore<
   }
 
   cancelMatches = () => {
-    this.state.pendingMatches?.forEach((match) => {
+    const currentPendingMatches = this.state.matches.filter(
+      (match) => match.status === 'pending',
+    )
+    const currentLoadingMatches = this.state.matches.filter(
+      (match) => match.isFetching === 'loader',
+    )
+    const matchesToCancelArray = new Set([
+      ...(this.state.pendingMatches ?? []),
+      ...currentPendingMatches,
+      ...currentLoadingMatches,
+    ])
+    matchesToCancelArray.forEach((match) => {
       this.cancelMatch(match.id)
     })
   }
 
+  /**
+   * Build the next ParsedLocation from navigation options without committing.
+   * Resolves `to`/`from`, params/search/hash/state, applies search validation
+   * and middlewares, and returns a stable, stringified location object.
+   *
+   * @link https://tanstack.com/router/latest/docs/framework/react/api/router/RouterType#buildlocation-method
+   */
   buildLocation: BuildLocationFn = (opts) => {
     const build = (
       dest: BuildNextOptions & {
@@ -1519,7 +1593,8 @@ export class RouterCore<
       } = {},
     ): ParsedLocation => {
       // We allow the caller to override the current location
-      const currentLocation = dest._fromLocation || this.latestLocation
+      const currentLocation =
+        dest._fromLocation || this.pendingBuiltLocation || this.latestLocation
 
       const allCurrentLocationMatches = this.matchRoutes(currentLocation, {
         _buildLocation: true,
@@ -1608,16 +1683,17 @@ export class RouterCore<
         }
       }
 
-      const nextPathname = interpolatePath({
-        // Use the original template path for interpolation
-        // This preserves the original parameter syntax including optional parameters
-        path: nextTo,
-        params: nextParams,
-        leaveWildcards: false,
-        leaveParams: opts.leaveParams,
-        decodeCharMap: this.pathParamsDecodeCharMap,
-        parseCache: this.parsePathnameCache,
-      }).interpolatedPath
+      const nextPathname = decodePath(
+        interpolatePath({
+          // Use the original template path for interpolation
+          // This preserves the original parameter syntax including optional parameters
+          path: nextTo,
+          params: nextParams,
+          leaveParams: opts.leaveParams,
+          decodeCharMap: this.pathParamsDecodeCharMap,
+          parseCache: this.parsePathnameCache,
+        }).interpolatedPath,
+      )
 
       // Resolve the next search
       let nextSearch = fromSearch
@@ -1759,6 +1835,10 @@ export class RouterCore<
 
   commitLocationPromise: undefined | ControlledPromise<void>
 
+  /**
+   * Commit a previously built location to history (push/replace), optionally
+   * using view transitions and scroll restoration options.
+   */
   commitLocation: CommitLocationFn = ({
     viewTransition,
     ignoreBlocker,
@@ -1849,6 +1929,7 @@ export class RouterCore<
     return this.commitLocationPromise
   }
 
+  /** Convenience helper: build a location from options, then commit it. */
   buildAndCommitLocation = ({
     replace,
     resetScroll,
@@ -1875,7 +1956,11 @@ export class RouterCore<
       _includeValidateSearch: true,
     })
 
-    return this.commitLocation({
+    this.pendingBuiltLocation = location as ParsedLocation<
+      FullSearchSchema<TRouteTree>
+    >
+
+    const commitPromise = this.commitLocation({
       ...location,
       viewTransition,
       replace,
@@ -1883,8 +1968,25 @@ export class RouterCore<
       hashScrollIntoView,
       ignoreBlocker,
     })
+
+    // Clear pending location after commit starts
+    // We do this on next microtask to allow synchronous navigate calls to chain
+    Promise.resolve().then(() => {
+      if (this.pendingBuiltLocation === location) {
+        this.pendingBuiltLocation = undefined
+      }
+    })
+
+    return commitPromise
   }
 
+  /**
+   * Imperatively navigate using standard `NavigateOptions`. When `reloadDocument`
+   * or an absolute `href` is provided, performs a full document navigation.
+   * Otherwise, builds and commits a client-side location.
+   *
+   * @link https://tanstack.com/router/latest/docs/framework/react/api/router/NavigateOptionsType
+   */
   navigate: NavigateFn = ({ to, reloadDocument, href, ...rest }) => {
     if (!reloadDocument && href) {
       try {
@@ -1896,7 +1998,7 @@ export class RouterCore<
     if (reloadDocument) {
       if (!href) {
         const location = this.buildLocation({ to, ...rest } as any)
-        href = location.href
+        href = location.url
       }
       if (rest.replace) {
         window.location.replace(href)
@@ -1946,7 +2048,12 @@ export class RouterCore<
         trimPath(normalizeUrl(this.latestLocation.href)) !==
         trimPath(normalizeUrl(nextLocation.href))
       ) {
-        throw redirect({ href: nextLocation.href })
+        let href = nextLocation.url
+        if (this.origin && href.startsWith(this.origin)) {
+          href = href.replace(this.origin, '') || '/'
+        }
+
+        throw redirect({ href })
       }
     }
 
@@ -2008,56 +2115,61 @@ export class RouterCore<
             // eslint-disable-next-line @typescript-eslint/require-await
             onReady: async () => {
               // eslint-disable-next-line @typescript-eslint/require-await
-              this.startViewTransition(async () => {
-                // this.viewTransitionPromise = createControlledPromise<true>()
+              // Wrap batch in framework-specific transition wrapper (e.g., Solid's startTransition)
+              this.startTransition(() => {
+                this.startViewTransition(async () => {
+                  // this.viewTransitionPromise = createControlledPromise<true>()
 
-                // Commit the pending matches. If a previous match was
-                // removed, place it in the cachedMatches
-                let exitingMatches!: Array<AnyRouteMatch>
-                let enteringMatches!: Array<AnyRouteMatch>
-                let stayingMatches!: Array<AnyRouteMatch>
+                  // Commit the pending matches. If a previous match was
+                  // removed, place it in the cachedMatches
+                  let exitingMatches: Array<AnyRouteMatch> = []
+                  let enteringMatches: Array<AnyRouteMatch> = []
+                  let stayingMatches: Array<AnyRouteMatch> = []
 
-                batch(() => {
-                  this.__store.setState((s) => {
-                    const previousMatches = s.matches
-                    const newMatches = s.pendingMatches || s.matches
+                  batch(() => {
+                    this.__store.setState((s) => {
+                      const previousMatches = s.matches
+                      const newMatches = s.pendingMatches || s.matches
 
-                    exitingMatches = previousMatches.filter(
-                      (match) => !newMatches.some((d) => d.id === match.id),
-                    )
-                    enteringMatches = newMatches.filter(
-                      (match) =>
-                        !previousMatches.some((d) => d.id === match.id),
-                    )
-                    stayingMatches = previousMatches.filter((match) =>
-                      newMatches.some((d) => d.id === match.id),
-                    )
+                      exitingMatches = previousMatches.filter(
+                        (match) => !newMatches.some((d) => d.id === match.id),
+                      )
+                      enteringMatches = newMatches.filter(
+                        (match) =>
+                          !previousMatches.some((d) => d.id === match.id),
+                      )
+                      stayingMatches = newMatches.filter((match) =>
+                        previousMatches.some((d) => d.id === match.id),
+                      )
 
-                    return {
-                      ...s,
-                      isLoading: false,
-                      loadedAt: Date.now(),
-                      matches: newMatches,
-                      pendingMatches: undefined,
-                      cachedMatches: [
-                        ...s.cachedMatches,
-                        ...exitingMatches.filter((d) => d.status !== 'error'),
-                      ],
-                    }
+                      return {
+                        ...s,
+                        isLoading: false,
+                        loadedAt: Date.now(),
+                        matches: newMatches,
+                        pendingMatches: undefined,
+                        cachedMatches: [
+                          ...s.cachedMatches,
+                          ...exitingMatches.filter((d) => d.status !== 'error'),
+                        ],
+                      }
+                    })
+                    this.clearExpiredCache()
                   })
-                  this.clearExpiredCache()
-                })
 
-                //
-                ;(
-                  [
-                    [exitingMatches, 'onLeave'],
-                    [enteringMatches, 'onEnter'],
-                    [stayingMatches, 'onStay'],
-                  ] as const
-                ).forEach(([matches, hook]) => {
-                  matches.forEach((match) => {
-                    this.looseRoutesById[match.routeId]!.options[hook]?.(match)
+                  //
+                  ;(
+                    [
+                      [exitingMatches, 'onLeave'],
+                      [enteringMatches, 'onEnter'],
+                      [stayingMatches, 'onStay'],
+                    ] as const
+                  ).forEach(([matches, hook]) => {
+                    matches.forEach((match) => {
+                      this.looseRoutesById[match.routeId]!.options[hook]?.(
+                        match,
+                      )
+                    })
                   })
                 })
               })
@@ -2111,10 +2223,16 @@ export class RouterCore<
       await this.latestLoadPromise
     }
 
+    let newStatusCode: number | undefined = undefined
     if (this.hasNotFoundMatch()) {
+      newStatusCode = 404
+    } else if (this.__store.state.matches.some((d) => d.status === 'error')) {
+      newStatusCode = 500
+    }
+    if (newStatusCode !== undefined) {
       this.__store.setState((s) => ({
         ...s,
-        statusCode: 404,
+        statusCode: newStatusCode,
       }))
     }
   }
@@ -2155,6 +2273,11 @@ export class RouterCore<
               )
             : shouldViewTransition.types
 
+        if (resolvedViewTransitionTypes === false) {
+          fn()
+          return
+        }
+
         startViewTransitionParams = {
           update: fn,
           types: resolvedViewTransitionTypes,
@@ -2170,23 +2293,27 @@ export class RouterCore<
   }
 
   updateMatch: UpdateMatchFn = (id, updater) => {
-    const matchesKey = this.state.pendingMatches?.some((d) => d.id === id)
-      ? 'pendingMatches'
-      : this.state.matches.some((d) => d.id === id)
-        ? 'matches'
-        : this.state.cachedMatches.some((d) => d.id === id)
-          ? 'cachedMatches'
-          : ''
+    this.startTransition(() => {
+      const matchesKey = this.state.pendingMatches?.some((d) => d.id === id)
+        ? 'pendingMatches'
+        : this.state.matches.some((d) => d.id === id)
+          ? 'matches'
+          : this.state.cachedMatches.some((d) => d.id === id)
+            ? 'cachedMatches'
+            : ''
 
-    if (matchesKey) {
-      this.__store.setState((s) => ({
-        ...s,
-        [matchesKey]: s[matchesKey]?.map((d) => (d.id === id ? updater(d) : d)),
-      }))
-    }
+      if (matchesKey) {
+        this.__store.setState((s) => ({
+          ...s,
+          [matchesKey]: s[matchesKey]?.map((d) =>
+            d.id === id ? updater(d) : d,
+          ),
+        }))
+      }
+    })
   }
 
-  getMatch: GetMatchFn = (matchId: string) => {
+  getMatch: GetMatchFn = (matchId: string): AnyRouteMatch | undefined => {
     const findFn = (d: { id: string }) => d.id === matchId
     return (
       this.state.cachedMatches.find(findFn) ??
@@ -2230,18 +2357,17 @@ export class RouterCore<
 
   resolveRedirect = (redirect: AnyRedirect): AnyRedirect => {
     if (!redirect.options.href) {
-      let href = this.buildLocation(redirect.options).url
+      const location = this.buildLocation(redirect.options)
+      let href = location.url
       if (this.origin && href.startsWith(this.origin)) {
         href = href.replace(this.origin, '') || '/'
       }
-      redirect.options.href = href
-      redirect.headers.set('Location', redirect.options.href)
+      redirect.options.href = location.href
+      redirect.headers.set('Location', href)
     }
-
     if (!redirect.headers.get('Location')) {
       redirect.headers.set('Location', redirect.options.href)
     }
-
     return redirect
   }
 
@@ -2437,8 +2563,10 @@ export class RouterCore<
   }
 }
 
+/** Error thrown when search parameter validation fails. */
 export class SearchParamError extends Error {}
 
+/** Error thrown when path parameter parsing/validation fails. */
 export class PathParamError extends Error {}
 
 const normalize = (str: string) =>
@@ -2447,9 +2575,10 @@ function comparePaths(a: string, b: string) {
   return normalize(a) === normalize(b)
 }
 
-// A function that takes an import() argument which is a function and returns a new function that will
-// proxy arguments from the caller to the imported function, retaining all type
-// information along the way
+/**
+ * Lazily import a module function and forward arguments to it, retaining
+ * parameter and return types for the selected export key.
+ */
 export function lazyFn<
   T extends Record<string, (...args: Array<any>) => any>,
   TKey extends keyof T = 'default',
@@ -2462,6 +2591,7 @@ export function lazyFn<
   }
 }
 
+/** Create an initial RouterState from a parsed location. */
 export function getInitialRouterState(
   location: ParsedLocation,
 ): RouterState<any> {
@@ -2507,6 +2637,10 @@ function validateSearch(validateSearch: AnyValidator, input: unknown): unknown {
   return {}
 }
 
+/**
+ * Build the matched route chain and extract params for a pathname.
+ * Falls back to the root route if no specific route is found.
+ */
 export function getMatchedRoutes<TRouteLike extends RouteLike>({
   pathname,
   routePathname,
